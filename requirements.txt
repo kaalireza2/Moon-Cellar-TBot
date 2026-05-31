@@ -1,0 +1,7 @@
+Flask==2.3.3
+telebot==0.0.5
+supabase==1.0.3
+requests==2.31.0
+python-dotenv==1.0.0
+gunicorn==20.1.0
+psutil==5.9.6
