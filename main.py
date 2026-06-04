@@ -13,6 +13,10 @@ from supabase import create_client, Client
 import json
 import platform
 import psutil
+import io
+import gzip
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # === Configuration ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -22,6 +26,12 @@ CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+# ==================== تنظیمات بکاپ ====================
+BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "")
+BACKUP_ADMIN_ID = os.getenv("BACKUP_ADMIN_ID", "")
+BACKUP_TIME = os.getenv("BACKUP_TIME", "03:00")
+MAX_BACKUPS = int(os.getenv("MAX_BACKUPS", "30"))
 
 # Setup logging
 logging.basicConfig(
@@ -52,13 +62,166 @@ admin_sessions = {}
 start_time = datetime.now()
 restart_count = 0
 
+# ==================== کلاس BackupManager ====================
+
+class BackupManager:
+    def __init__(self, supabase_client, bot_instance):
+        self.supabase = supabase_client
+        self.bot = bot_instance
+        self.backup_path = "/tmp/backups"
+        
+    def create_backup(self) -> dict:
+        """ایجاد بکاپ کامل از دیتابیس"""
+        try:
+            os.makedirs(self.backup_path, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_data = {
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "version": "1.0",
+                    "type": "full_backup"
+                },
+                "data": {}
+            }
+            
+            tables = ["films", "film_qualities", "series", "episodes"]
+            
+            for table in tables:
+                try:
+                    response = self.supabase.table(table).select("*").execute()
+                    backup_data["data"][table] = response.data
+                    logger.info(f"✅ Backup: {table} - {len(response.data)} records")
+                except Exception as e:
+                    logger.error(f"❌ Error backing up {table}: {e}")
+                    backup_data["data"][table] = []
+            
+            backup_file = os.path.join(self.backup_path, f"backup_{timestamp}.json")
+            with open(backup_file, 'w', encoding='utf-8') as f:
+                json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            
+            compressed_file = f"{backup_file}.gz"
+            with open(backup_file, 'rb') as f_in:
+                with gzip.open(compressed_file, 'wb') as f_out:
+                    f_out.writelines(f_in)
+            
+            os.remove(backup_file)
+            
+            file_size = os.path.getsize(compressed_file) / (1024 * 1024)
+            
+            backup_info = {
+                "file_path": compressed_file,
+                "timestamp": timestamp,
+                "size_mb": round(file_size, 2),
+                "tables": backup_data["data"],
+                "filename": f"backup_{timestamp}.json.gz"
+            }
+            
+            logger.info(f"✅ Backup created: {backup_info['filename']} ({backup_info['size_mb']} MB)")
+            self.cleanup_old_backups()
+            
+            return backup_info
+            
+        except Exception as e:
+            logger.error(f"❌ Backup failed: {e}")
+            return None
+    
+    def cleanup_old_backups(self):
+        """پاکسازی بکاپ‌های قدیمی"""
+        try:
+            if not os.path.exists(self.backup_path):
+                return
+            files = [f for f in os.listdir(self.backup_path) if f.endswith('.gz')]
+            files.sort()
+            
+            while len(files) > MAX_BACKUPS:
+                old_file = files.pop(0)
+                os.remove(os.path.join(self.backup_path, old_file))
+                logger.info(f"🗑️ Removed old backup: {old_file}")
+        except Exception as e:
+            logger.error(f"Error cleaning backups: {e}")
+    
+    def restore_from_backup(self, backup_file_path: str) -> bool:
+        """بازیابی دیتابیس از فایل بکاپ"""
+        try:
+            if backup_file_path.endswith('.gz'):
+                with gzip.open(backup_file_path, 'rb') as f:
+                    backup_data = json.loads(f.read().decode('utf-8'))
+            else:
+                with open(backup_file_path, 'r', encoding='utf-8') as f:
+                    backup_data = json.load(f)
+            
+            tables = ["films", "film_qualities", "series", "episodes"]
+            
+            for table in tables:
+                if table in backup_data["data"]:
+                    # پاک کردن اطلاعات قبلی
+                    self.supabase.table(table).delete().neq("id", 0).execute()
+                    
+                    # اضافه کردن اطلاعات جدید
+                    for record in backup_data["data"][table]:
+                        self.supabase.table(table).insert(record).execute()
+                    
+                    logger.info(f"✅ Restored {table}: {len(backup_data['data'][table])} records")
+            
+            logger.info("✅ Database restored successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Restore failed: {e}")
+            return False
+    
+    def send_backup_to_telegram(self, backup_info: dict):
+        """ارسال بکاپ به تلگرام"""
+        try:
+            stats = []
+            for table, data in backup_info["tables"].items():
+                if data:
+                    stats.append(f"• {table}: {len(data)} رکورد")
+            
+            stats_text = "\n".join(stats) if stats else "• هیچ داده‌ای موجود نیست"
+            
+            caption = (
+                f"✅ **پشتیبان‌گیری خودکار**\n\n"
+                f"🕐 **زمان:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📁 **نام فایل:** `{backup_info['filename']}`\n"
+                f"💾 **حجم:** {backup_info['size_mb']} MB\n\n"
+                f"📊 **آمار جداول:**\n{stats_text}"
+            )
+            
+            if BACKUP_CHANNEL_ID:
+                with open(backup_info["file_path"], 'rb') as f:
+                    self.bot.send_document(
+                        chat_id=BACKUP_CHANNEL_ID,
+                        document=f,
+                        caption=caption,
+                        parse_mode='Markdown'
+                    )
+                logger.info(f"✅ Backup sent to channel: {BACKUP_CHANNEL_ID}")
+            
+            if BACKUP_ADMIN_ID:
+                with open(backup_info["file_path"], 'rb') as f:
+                    self.bot.send_document(
+                        chat_id=BACKUP_ADMIN_ID,
+                        document=f,
+                        caption=caption,
+                        parse_mode='Markdown'
+                    )
+                logger.info(f"✅ Backup sent to admin: {BACKUP_ADMIN_ID}")
+            
+            os.remove(backup_info["file_path"])
+            
+        except Exception as e:
+            logger.error(f"❌ Error sending backup to Telegram: {e}")
+
+backup_manager = None
+
 # ==================== IMPROVED KEEP ALIVE MECHANISM ====================
 
 def keep_alive_ping():
     """پینگ کردن سلف برای جلوگیری از sleep شدن Render رایگان"""
     try:
         if RENDER_EXTERNAL_URL:
-            # پینگ چندین endpoint برای اطمینان
             endpoints = [
                 f"{RENDER_EXTERNAL_URL}/health",
                 f"{RENDER_EXTERNAL_URL}/ping", 
@@ -80,13 +243,10 @@ def keep_alive_ping():
                 logger.info(f"✅ Keep-alive successful ({success_count}/{len(endpoints)}) at {datetime.now().strftime('%H:%M:%S')}")
             else:
                 logger.warning(f"⚠️ All pings failed")
-                
         else:
             logger.warning("⚠️ RENDER_EXTERNAL_URL not set")
-                
     except Exception as e:
         logger.error(f"❌ Keep-alive ping error: {e}")
-
 
 def start_keep_alive():
     """شروع keep-alive بهبود یافته"""
@@ -94,15 +254,14 @@ def start_keep_alive():
         while True:
             try:
                 keep_alive_ping()
-                # برای Render رایگان: هر 45 ثانیه پینگ کن
-                time.sleep(45)  # تغییر از 120 به 45
+                time.sleep(45)
             except Exception as e:
                 logger.error(f"Keep-alive loop error: {e}")
                 time.sleep(30)
     
     keep_alive_thread = threading.Thread(target=ping_loop, daemon=True)
     keep_alive_thread.start()
-    logger.info("🔄 Keep-alive for FREE RENDER started (45 seconds interval)")  # متن لاگ رو هم تغییر بده
+    logger.info("🔄 Keep-alive for FREE RENDER started (45 seconds interval)")
 
 # ==================== SYSTEM MONITORING ====================
 
@@ -113,31 +272,22 @@ def cleanup_old_sessions():
         keys_to_remove = []
         
         for user_id, session in admin_sessions.items():
-            # اگر session بیش از 1 ساعت قدیمی شده
             if current_time - session.get('_timestamp', 0) > 3600:
                 keys_to_remove.append(user_id)
         
         for key in keys_to_remove:
             admin_sessions.pop(key, None)
             logger.info(f"🧹 Cleaned up old session for user {key}")
-            
     except Exception as e:
         logger.error(f"Error cleaning sessions: {e}")
 
 def get_system_status():
     """دریافت وضعیت سیستم"""
     try:
-        # تست اتصال به Supabase
         test_result = supabase.table("films").select("count", count="exact").limit(1).execute()
-        
-        # تست بات
         bot_info = bot.get_me()
-        
-        # محاسبه uptime
         uptime_seconds = time.time() - psutil.boot_time()
         uptime_str = str(timedelta(seconds=uptime_seconds))
-        
-        # حافظه
         memory = psutil.virtual_memory()
         
         return {
@@ -179,11 +329,8 @@ def check_membership(user_id):
 def create_film_caption(description, quality):
     """Create film caption with proper formatting"""
     caption_parts = []
-    
-    # اضافه کردن متن اول اگر وجود داشت
     if description:
         caption_parts.append(description)
-    
     caption_parts.append("#زیرنویس_چسبیده_فارسی🍷")
     caption_parts.append(f"کیفیت {quality} #بدون_سانسور")
     return "\n".join(caption_parts)
@@ -217,62 +364,29 @@ def home():
 
 @app.route('/health')
 def health():
-    """Endpoint سلامت برای پینگ کردن"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "service": "Telegram Film Bot"
-    }, 200
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "service": "Telegram Film Bot"}, 200
 
 @app.route('/ping')
 def ping():
-    """Endpoint ساده برای پینگ"""
     return "pong", 200
 
 @app.route('/status')
 def status():
-    """بررسی وضعیت بات و دیتابیس"""
     try:
         status_info = get_system_status()
         if "error" in status_info:
-            return {
-                "status": "error",
-                "error": status_info["error"],
-                "timestamp": datetime.now().isoformat()
-            }, 500
-        
-        return {
-            "status": "running",
-            "data": status_info,
-            "timestamp": datetime.now().isoformat()
-        }, 200
+            return {"status": "error", "error": status_info["error"], "timestamp": datetime.now().isoformat()}, 500
+        return {"status": "running", "data": status_info, "timestamp": datetime.now().isoformat()}, 200
     except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }, 500
+        return {"status": "error", "error": str(e), "timestamp": datetime.now().isoformat()}, 500
 
 @app.route('/bot_health')
 def bot_health():
-    """بررسی سلامت بات"""
     try:
-        # چک کن بات زنده هست
         bot_info = bot.get_me()
-        return {
-            "status": "healthy",
-            "bot_username": bot_info.username,
-            "bot_id": bot_info.id,
-            "timestamp": datetime.now().isoformat(),
-            "message": "Bot is running"
-        }, 200
+        return {"status": "healthy", "bot_username": bot_info.username, "bot_id": bot_info.id, "timestamp": datetime.now().isoformat(), "message": "Bot is running"}, 200
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat(),
-            "message": "Bot is not responding"
-        }, 500
+        return {"status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat(), "message": "Bot is not responding"}, 500
 
 # ==================== BOT HANDLERS ====================
 
@@ -292,13 +406,11 @@ def start_handler(message):
 
 @bot.message_handler(commands=['status', 'health'])
 def status_command(message):
-    """بررسی وضعیت بات"""
     if message.from_user.id not in ADMINS:
         return
     
     try:
         status_info = get_system_status()
-        
         if "error" in status_info:
             bot.send_message(message.chat.id, f"❌ خطا در بررسی وضعیت: {status_info['error']}")
             return
@@ -327,13 +439,54 @@ def status_command(message):
 • زمان: {status_info['current_time']}
 
 🔄 **Keep-alive: فعال**
-📡 **پینگ: هر 2 دقیقه**
+📡 **پینگ: هر 45 ثانیه**
         """
-        
         bot.send_message(message.chat.id, status_text, parse_mode='Markdown')
-        
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ خطا در بررسی وضعیت: {str(e)}")
+
+# ==================== دستورات بکاپ ====================
+
+@bot.message_handler(commands=['backup'])
+def backup_command(message):
+    """دستور دستی برای گرفتن بکاپ"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    bot.send_message(message.chat.id, "🔄 در حال گرفتن پشتیبان...")
+    
+    if not backup_manager:
+        bot.send_message(message.chat.id, "❌ سیستم پشتیبان‌گیری راه‌اندازی نشده")
+        return
+    
+    backup_info = backup_manager.create_backup()
+    
+    if backup_info:
+        try:
+            with open(backup_info["file_path"], 'rb') as f:
+                bot.send_document(
+                    message.chat.id,
+                    f,
+                    caption=f"✅ پشتیبان دستی\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n💾 حجم: {backup_info['size_mb']} MB"
+                )
+            os.remove(backup_info["file_path"])
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ خطا در ارسال: {e}")
+    else:
+        bot.send_message(message.chat.id, "❌ خطا در گرفتن پشتیبان")
+
+@bot.message_handler(commands=['restore'])
+def restore_command(message):
+    """بازیابی از بکاپ"""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    bot.send_message(
+        message.chat.id,
+        "📂 لطفاً فایل بکاپ (json یا json.gz) را ارسال کنید.\n\n⚠️ **هشدار**: این کار تمام اطلاعات فعلی را پاک می‌کند!"
+    )
+
+# ==================== ADMIN PANEL ====================
 
 def show_admin_panel(message):
     keyboard = InlineKeyboardMarkup()
@@ -346,7 +499,8 @@ def show_admin_panel(message):
         InlineKeyboardButton("🗑️ حذف محتوا", callback_data="admin_delete")
     )
     keyboard.row(
-        InlineKeyboardButton("📊 وضعیت سیستم", callback_data="admin_status")
+        InlineKeyboardButton("📊 وضعیت سیستم", callback_data="admin_status"),
+        InlineKeyboardButton("💾 پشتیبان", callback_data="admin_backup_menu")
     )
     
     bot.send_message(
@@ -380,7 +534,6 @@ def handle_deeplink(message, key):
         )
         return
     
-    # Check if it's a series episode (format: seriesKey_EpisodeNumber)
     if "_E" in key:
         series_key, ep_num = key.split("_E", 1)
         try:
@@ -390,28 +543,24 @@ def handle_deeplink(message, key):
         except ValueError:
             pass
 
-    # Check films from Supabase
     try:
         film_response = supabase.table("films").select("*").eq("key", key).execute()
         if film_response.data:
             film = film_response.data[0]
             qualities_response = supabase.table("film_qualities").select("*").eq("film_key", key).execute()
             qualities = [(q['quality'], q['file_id'], q['caption']) for q in qualities_response.data]
-            
             if qualities:
                 show_film_qualities(message, film, qualities)
                 return
     except Exception as e:
         logger.error(f"Error fetching film: {e}")
 
-    # Check series from Supabase
     try:
         series_response = supabase.table("series").select("*").eq("key", key).execute()
         if series_response.data:
             series = series_response.data[0]
             episodes_response = supabase.table("episodes").select("episode_number").eq("series_key", key).execute()
             episodes = [row['episode_number'] for row in episodes_response.data]
-            
             if episodes:
                 show_series_episodes(message, series, episodes)
                 return
@@ -423,8 +572,7 @@ def handle_deeplink(message, key):
 def show_film_qualities(message, film, qualities):
     film_key = film['key']
     title = film['title']
-    text = f"🎬 {title}\n\n"
-    text += "لطفاً کیفیت مورد نظر را انتخاب کنید:"
+    text = f"🎬 {title}\n\nلطفاً کیفیت مورد نظر را انتخاب کنید:"
     
     keyboard = InlineKeyboardMarkup()
     for quality, file_id, caption in qualities:
@@ -443,10 +591,8 @@ def show_series_episodes(message, series, episodes):
         text += f"\n{poster_description}"
     
     bot_username = bot.get_me().username
-    
-    # فقط episode_number های منحصر به فرد رو بگیر
     unique_episodes = list(set(episodes))
-    unique_episodes.sort()  # مرتب کردن
+    unique_episodes.sort()
     
     keyboard = InlineKeyboardMarkup()
     for ep_num in unique_episodes:
@@ -455,12 +601,7 @@ def show_series_episodes(message, series, episodes):
     
     try:
         if poster_file_id:
-            bot.send_photo(
-                message.chat.id,
-                poster_file_id,
-                caption=text,
-                reply_markup=keyboard
-            )
+            bot.send_photo(message.chat.id, poster_file_id, caption=text, reply_markup=keyboard)
         else:
             bot.send_message(message.chat.id, text, reply_markup=keyboard)
     except Exception as e:
@@ -469,14 +610,12 @@ def show_series_episodes(message, series, episodes):
 
 def show_episode_qualities(message, series_key, episode_num):
     try:
-        # فقط یک رکورد برای این قسمت بگیر (همه کیفیت‌ها رو با هم)
         episode_response = supabase.table("episodes").select("*").eq("series_key", series_key).eq("episode_number", episode_num).execute()
         
         if not episode_response.data:
             bot.send_message(message.chat.id, "❌ این قسمت یافت نشد.")
             return
 
-        # همه کیفیت‌های موجود برای این قسمت رو جمع کن
         qualities = []
         for episode in episode_response.data:
             qualities.append((episode['quality'], episode['file_id'], episode['caption']))
@@ -491,7 +630,7 @@ def show_episode_qualities(message, series_key, episode_num):
         logger.error(f"Error fetching episode: {e}")
         bot.send_message(message.chat.id, "❌ خطا در دریافت اطلاعات")
 
-# ==================== ADMIN HANDLERS ====================
+# ==================== ADMIN CALLBACK HANDLERS ====================
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
 def admin_callback_handler(call):
@@ -513,113 +652,85 @@ def admin_callback_handler(call):
     elif data == "admin_status":
         status_command(call.message)
         bot.answer_callback_query(call.id, "✅ وضعیت بررسی شد")
-        return
+    elif data == "admin_backup_menu":
+        show_backup_menu(call)
+    elif data == "admin_backup_now":
+        bot.answer_callback_query(call.id, "🔄 در حال گرفتن بکاپ...")
+        backup_command(call.message)
     elif data == "admin_done":
         admin_sessions.pop(user_id, None)
-        bot.edit_message_text(
-            "✅ عملیات با موفقیت завер شد.",
-            call.message.chat.id,
-            call.message.message_id
-        )
+        bot.edit_message_text("✅ عملیات با موفقیت تمام شد.", call.message.chat.id, call.message.message_id)
     elif data == "admin_add_another_quality":
-        user_id = call.from_user.id
         session = admin_sessions.get(user_id)
         if session and session.get("mode") == "add_film":
             session["step"] = "quality"
-            bot.edit_message_text(
-                "لطفاً کیفیت جدید را وارد کنید (مثال: 1080p):",
-                call.message.chat.id,
-                call.message.message_id
-            )
+            bot.edit_message_text("لطفاً کیفیت جدید را وارد کنید (مثال: 1080p):", call.message.chat.id, call.message.message_id)
     elif data == "admin_add_another_episode":
-        user_id = call.from_user.id
         session = admin_sessions.get(user_id)
         if session and session.get("mode") == "add_series":
             session["step"] = "episode_number"
-            bot.edit_message_text(
-                "لطفاً شماره قسمت جدید را وارد کنید:",
-                call.message.chat.id,
-                call.message.message_id
-            )
+            bot.edit_message_text("لطفاً شماره قسمت جدید را وارد کنید:", call.message.chat.id, call.message.message_id)
     elif data == "admin_add_episode_quality":
-        user_id = call.from_user.id
         session = admin_sessions.get(user_id)
         if session and session.get("mode") == "add_series":
             session["step"] = "episode_quality"
-            bot.edit_message_text(
-                "لطفاً کیفیت جدید برای این قسمت را وارد کنید:",
-                call.message.chat.id,
-                call.message.message_id
-            )
+            bot.edit_message_text("لطفاً کیفیت جدید برای این قسمت را وارد کنید:", call.message.chat.id, call.message.message_id)
     elif data == "admin_done_series":
-        user_id = call.from_user.id
         session = admin_sessions.get(user_id)
         if session and session.get("mode") == "add_series":
             bot_username = bot.get_me().username
             deeplink = f"https://t.me/{bot_username}?start={session['series_key']}"
-            
             bot.edit_message_text(
-                f"✅ سریال با موفقیت تکمیل شد!\n\n"
-                f"🔑 کلید: `{session['series_key']}`\n"
-                f"📺 عنوان: {session['series_title']}\n\n"
-                f"🔗 دیپ‌لینک:\n`{deeplink}`",
-                call.message.chat.id,
-                call.message.message_id,
-                parse_mode='Markdown'
+                f"✅ سریال با موفقیت تکمیل شد!\n\n🔑 کلید: `{session['series_key']}`\n📺 عنوان: {session['series_title']}\n\n🔗 دیپ‌لینک:\n`{deeplink}`",
+                call.message.chat.id, call.message.message_id, parse_mode='Markdown'
             )
             admin_sessions.pop(user_id, None)
 
-def start_add_film(call):
-    user_id = call.from_user.id
-    admin_sessions[user_id] = {
-        "mode": "add_film", 
-        "step": "key",
-        "_timestamp": time.time()
-    }
+def show_backup_menu(call):
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("💾 گرفتن بکاپ دستی", callback_data="admin_backup_now"))
+    keyboard.add(InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back"))
     
     bot.edit_message_text(
-        "🎬 افزودن فیلم جدید\n\nلطفاً کلید فیلم را وارد کنید (مثال: the_matrix):",
+        "💾 **پشتیبان‌گیری**\n\n"
+        "• بکاپ خودکار هر روز ساعت {} انجام می‌شود\n"
+        "• برای بکاپ دستی روی دکمه زیر کلیک کنید\n"
+        "• برای بازیابی از دستور /restore استفاده کنید".format(BACKUP_TIME),
         call.message.chat.id,
-        call.message.message_id
+        call.message.message_id,
+        reply_markup=keyboard,
+        parse_mode='Markdown'
     )
+
+def start_add_film(call):
+    user_id = call.from_user.id
+    admin_sessions[user_id] = {"mode": "add_film", "step": "key", "_timestamp": time.time()}
+    bot.edit_message_text("🎬 افزودن فیلم جدید\n\nلطفاً کلید فیلم را وارد کنید (مثال: the_matrix):", call.message.chat.id, call.message.message_id)
 
 def start_add_series(call):
     user_id = call.from_user.id
-    admin_sessions[user_id] = {
-        "mode": "add_series", 
-        "step": "key",
-        "_timestamp": time.time()
-    }
-    
-    bot.edit_message_text(
-        "📺 افزودن سریال جدید\n\nلطفاً کلید سریال را وارد کنید (مثال: breaking_bad):",
-        call.message.chat.id,
-        call.message.message_id
-    )
+    admin_sessions[user_id] = {"mode": "add_series", "step": "key", "_timestamp": time.time()}
+    bot.edit_message_text("📺 افزودن سریال جدید\n\nلطفاً کلید سریال را وارد کنید (مثال: breaking_bad):", call.message.chat.id, call.message.message_id)
 
 def show_content_list(call):
     try:
-        # Get films from Supabase
         films_response = supabase.table("films").select("key, title").execute()
         films = [(f['key'], f['title']) for f in films_response.data]
-        
-        # Get series from Supabase
         series_response = supabase.table("series").select("key, title").execute()
         series = [(s['key'], s['title']) for s in series_response.data]
         
         text = "📋 لیست محتوا\n\n"
+        bot_username = bot.get_me().username
         
         if films:
             text += "🎬 فیلم‌ها:\n"
             for film_key, title in films:
-                bot_username = bot.get_me().username
                 deeplink = f"https://t.me/{bot_username}?start={film_key}"
                 text += f"• {title} (`{film_key}`)\n🔗 `{deeplink}`\n\n"
         
         if series:
             text += "📺 سریال‌ها:\n"
             for series_key, title in series:
-                bot_username = bot.get_me().username
                 deeplink = f"https://t.me/{bot_username}?start={series_key}"
                 text += f"• {title} (`{series_key}`)\n🔗 `{deeplink}`\n\n"
         
@@ -631,32 +742,18 @@ def show_content_list(call):
             for part in parts:
                 bot.send_message(call.message.chat.id, part, parse_mode='Markdown')
         else:
-            bot.edit_message_text(
-                text,
-                call.message.chat.id,
-                call.message.message_id,
-                parse_mode='Markdown'
-            )
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error showing content list: {e}")
         bot.answer_callback_query(call.id, "❌ خطا در دریافت لیست")
 
 def show_delete_options(call):
     keyboard = InlineKeyboardMarkup()
-    keyboard.row(
-        InlineKeyboardButton("🎬 حذف فیلم", callback_data="delete_films"),
-        InlineKeyboardButton("📺 حذف سریال", callback_data="delete_series")
-    )
+    keyboard.row(InlineKeyboardButton("🎬 حذف فیلم", callback_data="delete_films"), InlineKeyboardButton("📺 حذف سریال", callback_data="delete_series"))
     keyboard.add(InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back"))
-    
-    bot.edit_message_text(
-        "🗑️ حذف محتوا\nلطفاً نوع محتوای مورد نظر برای حذف را انتخاب کنید:",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=keyboard
-    )
+    bot.edit_message_text("🗑️ حذف محتوا\nلطفاً نوع محتوای مورد نظر را انتخاب کنید:", call.message.chat.id, call.message.message_id, reply_markup=keyboard)
 
-# ==================== DELETE HANDLERS (FIXED) ====================
+# ==================== DELETE HANDLERS ====================
 
 @bot.callback_query_handler(func=lambda call: call.data in ['delete_films', 'delete_series'])
 def delete_options_handler(call):
@@ -665,11 +762,9 @@ def delete_options_handler(call):
         bot.answer_callback_query(call.id, "❌ دسترسی denied")
         return
     
-    data = call.data
-    
-    if data == "delete_films":
+    if call.data == "delete_films":
         show_films_for_deletion(call)
-    elif data == "delete_series":
+    elif call.data == "delete_series":
         show_series_for_deletion(call)
 
 def show_films_for_deletion(call):
@@ -683,22 +778,11 @@ def show_films_for_deletion(call):
         
         keyboard = InlineKeyboardMarkup()
         for film_id, film_key, title in films:
-            # استفاده از ID به جای کلید برای جلوگیری از طولانی شدن callback data
-            # و کوتاه کردن عنوان اگر طولانی باشه
             short_title = title[:30] + "..." if len(title) > 30 else title
-            keyboard.add(InlineKeyboardButton(
-                f"🗑️ {short_title}", 
-                callback_data=f"delf:{film_id}"  # استفاده از فرمت کوتاه
-            ))
+            keyboard.add(InlineKeyboardButton(f"🗑️ {short_title}", callback_data=f"delf:{film_id}"))
         
         keyboard.add(InlineKeyboardButton("🔙 بازگشت", callback_data="admin_delete"))
-        
-        bot.edit_message_text(
-            "🎬 انتخاب فیلم برای حذف:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboard
-        )
+        bot.edit_message_text("🎬 انتخاب فیلم برای حذف:", call.message.chat.id, call.message.message_id, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Error showing films for deletion: {e}")
         bot.answer_callback_query(call.id, "❌ خطا در دریافت لیست")
@@ -714,21 +798,11 @@ def show_series_for_deletion(call):
         
         keyboard = InlineKeyboardMarkup()
         for series_id, series_key, title in series:
-            # استفاده از ID به جای کلید برای جلوگیری از طولانی شدن callback data
             short_title = title[:30] + "..." if len(title) > 30 else title
-            keyboard.add(InlineKeyboardButton(
-                f"🗑️ {short_title}", 
-                callback_data=f"dels:{series_id}"  # استفاده از فرمت کوتاه
-            ))
+            keyboard.add(InlineKeyboardButton(f"🗑️ {short_title}", callback_data=f"dels:{series_id}"))
         
         keyboard.add(InlineKeyboardButton("🔙 بازگشت", callback_data="admin_delete"))
-        
-        bot.edit_message_text(
-            "📺 انتخاب سریال برای حذف:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboard
-        )
+        bot.edit_message_text("📺 انتخاب سریال برای حذف:", call.message.chat.id, call.message.message_id, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Error showing series for deletion: {e}")
         bot.answer_callback_query(call.id, "❌ خطا در دریافت لیست")
@@ -740,30 +814,22 @@ def delete_callback_handler(call):
         bot.answer_callback_query(call.id, "❌ دسترسی denied")
         return
     
-    data = call.data
-    
-    if data.startswith("delf:"):
-        film_id = data.split(":")[1]
+    if call.data.startswith("delf:"):
+        film_id = call.data.split(":")[1]
         delete_film(call, film_id)
-    elif data.startswith("dels:"):
-        series_id = data.split(":")[1]
+    elif call.data.startswith("dels:"):
+        series_id = call.data.split(":")[1]
         delete_series(call, series_id)
 
 def delete_film(call, film_id):
     try:
-        # ابتدا film_key رو پیدا کن
         film_response = supabase.table("films").select("key").eq("id", film_id).execute()
         if not film_response.data:
             bot.answer_callback_query(call.id, "❌ فیلم مورد نظر یافت نشد")
             return
-            
         film_key = film_response.data[0]['key']
-        
-        # Delete film qualities first (foreign key constraint)
         supabase.table("film_qualities").delete().eq("film_key", film_key).execute()
-        # Delete film
         supabase.table("films").delete().eq("id", film_id).execute()
-        
         bot.answer_callback_query(call.id, "✅ فیلم با موفقیت حذف شد")
         show_admin_panel(call.message)
     except Exception as e:
@@ -772,19 +838,13 @@ def delete_film(call, film_id):
 
 def delete_series(call, series_id):
     try:
-        # ابتدا series_key رو پیدا کن
         series_response = supabase.table("series").select("key").eq("id", series_id).execute()
         if not series_response.data:
             bot.answer_callback_query(call.id, "❌ سریال مورد نظر یافت نشد")
             return
-            
         series_key = series_response.data[0]['key']
-        
-        # Delete episodes first (foreign key constraint)
         supabase.table("episodes").delete().eq("series_key", series_key).execute()
-        # Delete series
         supabase.table("series").delete().eq("id", series_id).execute()
-        
         bot.answer_callback_query(call.id, "✅ سریال با موفقیت حذف شد")
         show_admin_panel(call.message)
     except Exception as e:
@@ -825,30 +885,21 @@ def handle_film_flow(message, text, step, session):
         session["step"] = "title"
         session["_timestamp"] = time.time()
         bot.send_message(message.chat.id, "لطفاً عنوان فیلم را وارد کنید:")
-        
     elif step == "title":
         session["film_title"] = text
         session["step"] = "description"
         session["_timestamp"] = time.time()
-        bot.send_message(
-            message.chat.id,
-            "لطفاً توضیحات فیلم را وارد کنید (متن اول کپشن):\nیا /skip برای رد کردن"
-        )
-        
+        bot.send_message(message.chat.id, "لطفاً توضیحات فیلم را وارد کنید:\nیا /skip برای رد کردن")
     elif step == "description":
         session["film_description"] = None if text == "/skip" else text
         session["step"] = "quality"
         session["_timestamp"] = time.time()
         bot.send_message(message.chat.id, "لطفاً کیفیت اول را وارد کنید (مثال: 720p):")
-        
     elif step == "quality":
         session["current_quality"] = text
         session["step"] = "file"
         session["_timestamp"] = time.time()
-        bot.send_message(
-            message.chat.id,
-            f"✅ کیفیت '{text}' ثبت شد\n\nلطفاً فایل را ارسال کنید:"
-        )
+        bot.send_message(message.chat.id, f"✅ کیفیت '{text}' ثبت شد\n\nلطفاً فایل را ارسال کنید:")
 
 def handle_series_flow(message, text, step, session):
     if step == "key":
@@ -856,42 +907,26 @@ def handle_series_flow(message, text, step, session):
         session["step"] = "title"
         session["_timestamp"] = time.time()
         bot.send_message(message.chat.id, "لطفاً عنوان سریال را وارد کنید:")
-        
     elif step == "title":
         session["series_title"] = text
         session["step"] = "poster_desc"
         session["_timestamp"] = time.time()
-        bot.send_message(
-            message.chat.id,
-            "لطفاً توضیحات پوستر را وارد کنید:\nیا /skip برای رد کردن"
-        )
-        
+        bot.send_message(message.chat.id, "لطفاً توضیحات پوستر را وارد کنید:\nیا /skip برای رد کردن")
     elif step == "poster_desc":
         session["poster_description"] = None if text == "/skip" else text
         session["step"] = "poster_file"
         session["_timestamp"] = time.time()
-        bot.send_message(
-            message.chat.id,
-            "لطفاً عکس پوستر را ارسال کنید:\nیا /skip برای رد کردن"
-        )
-        
+        bot.send_message(message.chat.id, "لطفاً عکس پوستر را ارسال کنید:\nیا /skip برای رد کردن")
     elif step == "poster_file":
         if text == "/skip":
             session["poster_file_id"] = None
             session["step"] = "caption_template"
             session["_timestamp"] = time.time()
-            bot.send_message(
-                message.chat.id,
-                "لطفاً قالب کپشن قسمت‌ها را وارد کنید:\nیا /skip برای استفاده از قالب پیش‌فرض"
-            )
+            bot.send_message(message.chat.id, "لطفاً قالب کپشن قسمت‌ها را وارد کنید:\nیا /skip برای استفاده از قالب پیش‌فرض")
         else:
             bot.send_message(message.chat.id, "❌ لطفاً یک عکس ارسال کنید یا /skip بزنید")
-            
     elif step == "caption_template":
         session["caption_template"] = None if text == "/skip" else text
-        session["_timestamp"] = time.time()
-        
-        # Create series in Supabase
         try:
             supabase.table("series").insert({
                 "key": session["series_key"],
@@ -900,63 +935,34 @@ def handle_series_flow(message, text, step, session):
                 "poster_description": session.get("poster_description"),
                 "caption_template": session.get("caption_template")
             }).execute()
-            
             session["step"] = "episode_number"
-            session["_timestamp"] = time.time()
-            bot.send_message(
-                message.chat.id,
-                "✅ سریال ایجاد شد!\n\nلطفاً شماره قسمت اول را وارد کنید:\n(یا /done برای اتمام)"
-            )
+            bot.send_message(message.chat.id, "✅ سریال ایجاد شد!\n\nلطفاً شماره قسمت اول را وارد کنید:\n(یا /done برای اتمام)")
         except Exception as e:
             logger.error(f"Error creating series: {e}")
             bot.send_message(message.chat.id, "❌ خطا در ایجاد سریال")
             admin_sessions.pop(message.from_user.id, None)
-        
     elif step == "episode_number":
         if text.lower() in ['/done', 'done', 'اتمام']:
-            # Finish series
             bot_username = bot.get_me().username
             deeplink = f"https://t.me/{bot_username}?start={session['series_key']}"
-            
-            bot.send_message(
-                message.chat.id,
-                f"✅ سریال با موفقیت ایجاد شد!\n\n"
-                f"🔑 کلید: `{session['series_key']}`\n"
-                f"📝 توضیحات: {session.get('poster_description', 'بدون توضیح')}\n\n"
-                f"دیپ‌لینک:\n`{deeplink}`",
-                parse_mode='Markdown'
-            )
-            
+            bot.send_message(message.chat.id, f"✅ سریال با موفقیت ایجاد شد!\n\n🔑 کلید: `{session['series_key']}`\n🔗 دیپ‌لینک:\n`{deeplink}`", parse_mode='Markdown')
             admin_sessions.pop(message.from_user.id, None)
             return
-            
         try:
             episode_num = int(text)
             session["current_episode"] = episode_num
             session["step"] = "episode_quality"
-            session["_timestamp"] = time.time()
-            bot.send_message(
-                message.chat.id,
-                f"✅ قسمت {episode_num} انتخاب شد\n\nلطفاً کیفیت این قسمت را وارد کنید:"
-            )
+            bot.send_message(message.chat.id, f"✅ قسمت {episode_num} انتخاب شد\n\nلطفاً کیفیت این قسمت را وارد کنید:")
         except ValueError:
             bot.send_message(message.chat.id, "❌ لطفاً یک عدد معتبر وارد کنید")
-            
     elif step == "episode_quality":
         session["current_quality"] = text
         session["step"] = "episode_file"
-        session["_timestamp"] = time.time()
-        bot.send_message(
-            message.chat.id,
-            f"✅ کیفیت '{text}' ثبت شد\n\nلطفاً فایل این قسمت را ارسال کنید:"
-        )
+        bot.send_message(message.chat.id, f"✅ کیفیت '{text}' ثبت شد\n\nلطفاً فایل این قسمت را ارسال کنید:")
 
 # ==================== FILE HANDLERS ====================
 
-@bot.message_handler(
-    func=lambda message: message.from_user.id in ADMINS and message.photo,
-    content_types=['photo']
-)
+@bot.message_handler(func=lambda message: message.from_user.id in ADMINS and message.photo, content_types=['photo'])
 def admin_photo_handler(message):
     user_id = message.from_user.id
     session = admin_sessions.get(user_id)
@@ -968,17 +974,9 @@ def admin_photo_handler(message):
     session["poster_file_id"] = file_id
     session["step"] = "caption_template"
     session["_timestamp"] = time.time()
-    
-    bot.send_message(
-        message.chat.id,
-        "✅ پوستر ثبت شد\n\nلطفاً قالب کپشن قسمت‌ها را وارد کنید (متن اول):\nیا /skip برای قالب پیش‌فرض"
-    )
+    bot.send_message(message.chat.id, "✅ پوستر ثبت شد\n\nلطفاً قالب کپشن قسمت‌ها را وارد کنید:\nیا /skip برای قالب پیش‌فرض")
 
-@bot.message_handler(
-    func=lambda message: message.from_user.id in ADMINS and 
-    (message.document or message.video or message.audio),
-    content_types=['document', 'video', 'audio']
-)
+@bot.message_handler(func=lambda message: message.from_user.id in ADMINS and (message.document or message.video or message.audio), content_types=['document', 'video', 'audio'])
 def admin_file_handler(message):
     user_id = message.from_user.id
     session = admin_sessions.get(user_id)
@@ -989,16 +987,73 @@ def admin_file_handler(message):
     step = session.get("step")
     mode = session.get("mode")
     
-    # Handle film files
     if mode == "add_film" and step == "file":
         handle_film_file(message, session, user_id)
-    
-    # Handle series episode files
     elif mode == "add_series" and step == "episode_file":
         handle_episode_file(message, session, user_id)
 
+@bot.message_handler(content_types=['document'])
+def handle_backup_file(message):
+    if message.from_user.id not in ADMINS:
+        return
+    
+    if not message.document:
+        return
+    
+    filename = message.document.file_name
+    if not (filename.endswith('.json') or filename.endswith('.json.gz')):
+        return
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.row(InlineKeyboardButton("✅ بله، بازیابی کن", callback_data="confirm_restore"), InlineKeyboardButton("❌ لغو", callback_data="cancel_restore"))
+    
+    bot.send_message(message.chat.id, f"⚠️ **تأیید بازیابی**\n\nفایل: `{filename}`\n\nآیا مطمئن هستید؟", reply_markup=keyboard, parse_mode='Markdown')
+    
+    file_info = bot.get_file(message.document.file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    
+    temp_path = f"/tmp/restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json.gz"
+    with open(temp_path, 'wb') as f:
+        f.write(downloaded_file)
+    
+    admin_sessions[message.from_user.id] = {"mode": "restore", "backup_file": temp_path, "_timestamp": time.time()}
+
+@bot.callback_query_handler(func=lambda call: call.data in ['confirm_restore', 'cancel_restore'])
+def restore_callback_handler(call):
+    user_id = call.from_user.id
+    
+    if user_id not in ADMINS:
+        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        return
+    
+    session = admin_sessions.get(user_id, {})
+    
+    if call.data == "cancel_restore":
+        bot.edit_message_text("❌ عملیات بازیابی لغو شد.", call.message.chat.id, call.message.message_id)
+        if session.get("backup_file") and os.path.exists(session["backup_file"]):
+            os.remove(session["backup_file"])
+        admin_sessions.pop(user_id, None)
+    elif call.data == "confirm_restore":
+        bot.edit_message_text("🔄 در حال بازیابی اطلاعات...", call.message.chat.id, call.message.message_id)
+        
+        if not backup_manager:
+            bot.send_message(call.message.chat.id, "❌ سیستم پشتیبان‌گیری راه‌اندازی نشده")
+            return
+        
+        backup_file = session.get("backup_file")
+        if not backup_file or not os.path.exists(backup_file):
+            bot.send_message(call.message.chat.id, "❌ فایل بکاپ یافت نشد")
+            return
+        
+        if backup_manager.restore_from_backup(backup_file):
+            bot.send_message(call.message.chat.id, "✅ دیتابیس با موفقیت بازیابی شد!")
+        else:
+            bot.send_message(call.message.chat.id, "❌ خطا در بازیابی دیتابیس")
+        
+        os.remove(backup_file)
+        admin_sessions.pop(user_id, None)
+
 def handle_film_file(message, session, user_id):
-    # Get file_id based on content type
     if message.document:
         file_id = message.document.file_id
     elif message.video:
@@ -1009,30 +1064,20 @@ def handle_film_file(message, session, user_id):
         bot.send_message(message.chat.id, "❌ لطفاً یک فایل معتبر ارسال کنید")
         return
     
-    # Create caption با متن اول
-    caption = create_film_caption(
-        session.get("film_description"), 
-        session["current_quality"]
-    )
+    caption = create_film_caption(session.get("film_description"), session["current_quality"])
     
-    # Save to Supabase
     try:
-        # فقط چک کن فیلم وجود داره یا نه، اگر نه ایجادش کن
         film_exists = supabase.table("films").select("key").eq("key", session["film_key"]).execute()
         
         if not film_exists.data:
-            # فیلم وجود نداره، ایجادش کن
             supabase.table("films").insert({
                 "key": session["film_key"],
                 "title": session["film_title"],
                 "description": session.get("film_description")
             }).execute()
             logger.info(f"✅ Film created: {session['film_key']}")
-        else:
-            logger.info(f"✅ Film already exists: {session['film_key']}")
         
-        # اضافه کردن کیفیت جدید
-        quality_result = supabase.table("film_qualities").upsert({
+        supabase.table("film_qualities").upsert({
             "film_key": session["film_key"],
             "quality": session["current_quality"],
             "file_id": file_id,
@@ -1042,34 +1087,20 @@ def handle_film_file(message, session, user_id):
         
         logger.info(f"✅ Quality added - Film: {session['film_key']}, Quality: {session['current_quality']}")
         
-        # Generate deeplink
         bot_username = bot.get_me().username
         deeplink = f"https://t.me/{bot_username}?start={session['film_key']}"
         
         keyboard = InlineKeyboardMarkup()
-        keyboard.row(
-            InlineKeyboardButton("➕ کیفیت دیگر", callback_data="admin_add_another_quality"),
-            InlineKeyboardButton("✅ اتمام", callback_data="admin_done")
-        )
+        keyboard.row(InlineKeyboardButton("➕ کیفیت دیگر", callback_data="admin_add_another_quality"), InlineKeyboardButton("✅ اتمام", callback_data="admin_done"))
         
-        bot.send_message(
-            message.chat.id,
-            f"✅ کیفیت '{session['current_quality']}' اضافه شد!\n\n"
-            f"🔑 کلید: `{session['film_key']}`\n"
-            f"🎬 فیلم: {session['film_title']}\n\n"
-            f"🔗 دیپ‌لینک:\n`{deeplink}`",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
+        bot.send_message(message.chat.id, f"✅ کیفیت '{session['current_quality']}' اضافه شد!\n\n🔑 کلید: `{session['film_key']}`\n🎬 فیلم: {session['film_title']}\n\n🔗 دیپ‌لینک:\n`{deeplink}`", reply_markup=keyboard, parse_mode='Markdown')
         
         session["step"] = "complete"
-        
     except Exception as e:
         logger.error(f"❌ Error saving film to Supabase: {str(e)}")
         bot.send_message(message.chat.id, f"❌ خطا در ذخیره فیلم: {str(e)}")
 
 def handle_episode_file(message, session, user_id):
-    # Get file_id based on content type
     if message.document:
         file_id = message.document.file_id
     elif message.video:
@@ -1080,14 +1111,8 @@ def handle_episode_file(message, session, user_id):
         bot.send_message(message.chat.id, "❌ لطفاً یک فایل معتبر ارسال کنید")
         return
     
-    # Create episode caption
-    caption = create_episode_caption(
-        session.get("caption_template"),
-        session["current_episode"],
-        session["current_quality"]
-    )
+    caption = create_episode_caption(session.get("caption_template"), session["current_episode"], session["current_quality"])
     
-    # Add episode to Supabase
     try:
         supabase.table("episodes").insert({
             "series_key": session["series_key"],
@@ -1098,24 +1123,14 @@ def handle_episode_file(message, session, user_id):
             "added_by": user_id
         }).execute()
         
-        # Generate deeplink
         bot_username = bot.get_me().username
         series_deeplink = f"https://t.me/{bot_username}?start={session['series_key']}"
         
         keyboard = InlineKeyboardMarkup()
-        keyboard.row(
-            InlineKeyboardButton("➕ قسمت دیگر", callback_data="admin_add_another_episode"),
-            InlineKeyboardButton("➕ کیفیت دیگر", callback_data="admin_add_episode_quality")
-        )
+        keyboard.row(InlineKeyboardButton("➕ قسمت دیگر", callback_data="admin_add_another_episode"), InlineKeyboardButton("➕ کیفیت دیگر", callback_data="admin_add_episode_quality"))
         keyboard.add(InlineKeyboardButton("✅ اتمام", callback_data="admin_done_series"))
         
-        bot.send_message(
-            message.chat.id,
-            f"✅ قسمت {session['current_episode']} با کیفیت {session['current_quality']} اضافه شد!\n\n"
-            f"🔗 دیپ‌لینک سریال:\n`{series_deeplink}`",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
+        bot.send_message(message.chat.id, f"✅ قسمت {session['current_episode']} با کیفیت {session['current_quality']} اضافه شد!\n\n🔗 دیپ‌لینک سریال:\n`{series_deeplink}`", reply_markup=keyboard, parse_mode='Markdown')
         
         session["step"] = "episode_complete"
     except Exception as e:
@@ -1126,59 +1141,36 @@ def handle_episode_file(message, session, user_id):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('quality:'))
 def quality_callback_handler(call):
-    data = call.data
-    parts = data.split(':')
-    
+    parts = call.data.split(':')
     if len(parts) == 3:
-        film_key = parts[1]
-        quality = parts[2]
-        
+        film_key, quality = parts[1], parts[2]
         try:
-            result_response = supabase.table("film_qualities").select("file_id, caption").eq("film_key", film_key).eq("quality", quality).execute()
-            if result_response.data:
-                result = result_response.data[0]
-                file_id = result['file_id']
-                caption = result['caption']
-                
-                try:
-                    bot.send_document(call.message.chat.id, file_id, caption=caption)
-                    bot.answer_callback_query(call.id, "✅ فایل ارسال شد")
-                except Exception as e:
-                    logger.error(f"Error sending file: {e}")
-                    bot.answer_callback_query(call.id, "❌ خطا در ارسال فایل")
+            result = supabase.table("film_qualities").select("file_id, caption").eq("film_key", film_key).eq("quality", quality).execute()
+            if result.data:
+                r = result.data[0]
+                bot.send_document(call.message.chat.id, r['file_id'], caption=r['caption'])
+                bot.answer_callback_query(call.id, "✅ فایل ارسال شد")
             else:
                 bot.answer_callback_query(call.id, "❌ فایل یافت نشد")
         except Exception as e:
-            logger.error(f"Error fetching file: {e}")
+            logger.error(f"Error: {e}")
             bot.answer_callback_query(call.id, "❌ خطا در دریافت فایل")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('episode:'))
 def episode_callback_handler(call):
-    data = call.data
-    parts = data.split(':')
-    
+    parts = call.data.split(':')
     if len(parts) == 4:
-        series_key = parts[1]
-        episode_num = int(parts[2])
-        quality = parts[3]
-        
+        series_key, episode_num, quality = parts[1], int(parts[2]), parts[3]
         try:
-            result_response = supabase.table("episodes").select("file_id, caption").eq("series_key", series_key).eq("episode_number", episode_num).eq("quality", quality).execute()
-            if result_response.data:
-                result = result_response.data[0]
-                file_id = result['file_id']
-                caption = result['caption']
-                
-                try:
-                    bot.send_document(call.message.chat.id, file_id, caption=caption)
-                    bot.answer_callback_query(call.id, "✅ فایل ارسال شد")
-                except Exception as e:
-                    logger.error(f"Error sending file: {e}")
-                    bot.answer_callback_query(call.id, "❌ خطا در ارسال فایل")
+            result = supabase.table("episodes").select("file_id, caption").eq("series_key", series_key).eq("episode_number", episode_num).eq("quality", quality).execute()
+            if result.data:
+                r = result.data[0]
+                bot.send_document(call.message.chat.id, r['file_id'], caption=r['caption'])
+                bot.answer_callback_query(call.id, "✅ فایل ارسال شد")
             else:
                 bot.answer_callback_query(call.id, "❌ فایل یافت نشد")
         except Exception as e:
-            logger.error(f"Error fetching file: {e}")
+            logger.error(f"Error: {e}")
             bot.answer_callback_query(call.id, "❌ خطا در دریافت فایل")
 
 # ==================== OTHER HANDLERS ====================
@@ -1187,19 +1179,10 @@ def episode_callback_handler(call):
 def check_join_handler(call):
     if check_membership(call.from_user.id):
         bot.answer_callback_query(call.id, "✅ عضویت شما تایید شد!")
-        bot.edit_message_text(
-            "✅ عضویت شما تایید شد!\nاکنون می‌توانید از لینک‌ها استفاده کنید.",
-            call.message.chat.id,
-            call.message.message_id
-        )
+        bot.edit_message_text("✅ عضویت شما تایید شد!\nاکنون می‌توانید از لینک‌ها استفاده کنید.", call.message.chat.id, call.message.message_id)
     else:
         bot.answer_callback_query(call.id, "❌ هنوز عضو نشدید")
-        bot.edit_message_text(
-            "❌ هنوز عضو نشدید. لطفاً در کانال عضو شوید:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=build_join_keyboard()
-        )
+        bot.edit_message_text("❌ هنوز عضو نشدید. لطفاً در کانال عضو شوید:", call.message.chat.id, call.message.message_id, reply_markup=build_join_keyboard())
 
 @bot.message_handler(func=lambda message: True)
 def all_messages(message):
@@ -1208,6 +1191,40 @@ def all_messages(message):
     else:
         show_user_welcome(message)
 
+# ==================== FUNCTIONS FOR BACKUP SCHEDULER ====================
+
+def setup_auto_backup(bot_instance):
+    """راه‌اندازی سیستم پشتیبان‌گیری خودکار"""
+    global backup_manager
+    backup_manager = BackupManager(supabase, bot_instance)
+    
+    scheduler = BackgroundScheduler()
+    hour, minute = map(int, BACKUP_TIME.split(':'))
+    
+    scheduler.add_job(
+        func=lambda: scheduled_backup(bot_instance),
+        trigger=CronTrigger(hour=hour, minute=minute),
+        id="daily_backup",
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    logger.info(f"✅ Auto-backup scheduled at {BACKUP_TIME} daily")
+    return scheduler
+
+def scheduled_backup(bot_instance):
+    """اجرای بکاپ زمانبندی شده"""
+    logger.info("🔄 Starting scheduled backup...")
+    if not backup_manager:
+        logger.error("Backup manager not initialized")
+        return
+    
+    backup_info = backup_manager.create_backup()
+    if backup_info:
+        backup_manager.send_backup_to_telegram(backup_info)
+    else:
+        logger.error("❌ Scheduled backup failed")
+
 # ==================== MAIN EXECUTION ====================
 
 def run_flask():
@@ -1215,71 +1232,45 @@ def run_flask():
     app.run(host='0.0.0.0', port=port, debug=False)
 
 def run_bot():
-    """تابع بهبود یافته برای اجرای بات"""
     global restart_count
     logger.info("Starting bot polling with health monitoring...")
-    
-    # متغیرهای مانیتورینگ
     last_restart = datetime.now()
     
     while True:
         try:
             logger.info(f"🚀 Starting bot polling (attempt {restart_count + 1})")
-            
-            # پاکسازی sessionهای قدیمی
             cleanup_old_sessions()
-            
-            # شروع polling با تنظیمات بهتر
-            bot.infinity_polling(
-                timeout=60, 
-                long_polling_timeout=60, 
-                skip_pending=True
-            )
-            
+            bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
         except Exception as e:
             restart_count += 1
             current_time = datetime.now()
             time_since_last_restart = (current_time - last_restart).total_seconds()
             last_restart = current_time
-            
             logger.error(f"Bot polling error: {e}")
             
-            # اگر بیش از 5 بار در 5 دقیقه restart کرد، بیشتر صبر کن
-            if restart_count > 5 and time_since_last_restart < 300:
-                wait_time = 300  # 5 دقیقه
-                logger.warning(f"⚠️ Too many restarts. Waiting {wait_time} seconds...")
-            else:
-                wait_time = 30
-            
+            wait_time = 300 if (restart_count > 5 and time_since_last_restart < 300) else 30
             logger.info(f"Restarting bot in {wait_time} seconds...")
             time.sleep(wait_time)
             
-            # اگر بیش از 20 بار restart کرد، لاگ ویژه
             if restart_count > 20:
                 logger.critical(f"🚨 CRITICAL: Bot restarted {restart_count} times!")
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting bot with IMPROVED stability...")
-    
-    # ثبت زمان شروع
+    logger.info("🚀 Starting bot with BACKUP system...")
     start_time = datetime.now()
     logger.info(f"📅 Start time: {start_time}")
     
     try:
-        # Start keep-alive mechanism (بهبود یافته)
+        setup_auto_backup(bot)
         start_keep_alive()
         
-        # Start bot in a separate thread
         bot_thread = threading.Thread(target=run_bot, daemon=True)
         bot_thread.start()
         
         logger.info("✅ Bot thread started successfully!")
-        
-        # نمایش اطلاعات
         bot_info = bot.get_me()
         logger.info(f"🤖 Bot info: @{bot_info.username} (ID: {bot_info.id})")
         
-        # Start Flask in main thread
         port = int(os.getenv("PORT", 10000))
         logger.info(f"🌐 Starting Flask on port {port}")
         run_flask()
