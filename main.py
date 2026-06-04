@@ -13,7 +13,6 @@ from supabase import create_client, Client
 import json
 import platform
 import psutil
-import io
 import gzip
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -128,6 +127,8 @@ class BackupManager:
     
     def cleanup_old_backups(self):
         """پاکسازی بکاپ‌های قدیمی"""
+        if MAX_BACKUPS <= 0:   # FIXED: اگر مقدار نامعتبر بود، پاکسازی نکن
+            return
         try:
             if not os.path.exists(self.backup_path):
                 return
@@ -158,9 +159,10 @@ class BackupManager:
                     # پاک کردن اطلاعات قبلی
                     self.supabase.table(table).delete().neq("id", 0).execute()
                     
-                    # اضافه کردن اطلاعات جدید
+                    # اضافه کردن اطلاعات جدید بدون فیلد id (FIXED)
                     for record in backup_data["data"][table]:
-                        self.supabase.table(table).insert(record).execute()
+                        record_copy = {k: v for k, v in record.items() if k != 'id'}
+                        self.supabase.table(table).insert(record_copy).execute()
                     
                     logger.info(f"✅ Restored {table}: {len(backup_data['data'][table])} records")
             
@@ -173,6 +175,7 @@ class BackupManager:
     
     def send_backup_to_telegram(self, backup_info: dict):
         """ارسال بکاپ به تلگرام"""
+        file_path = backup_info["file_path"]
         try:
             stats = []
             for table, data in backup_info["tables"].items():
@@ -189,30 +192,41 @@ class BackupManager:
                 f"📊 **آمار جداول:**\n{stats_text}"
             )
             
+            # ارسال به کانال (در صورت وجود)
             if BACKUP_CHANNEL_ID:
-                with open(backup_info["file_path"], 'rb') as f:
-                    self.bot.send_document(
-                        chat_id=BACKUP_CHANNEL_ID,
-                        document=f,
-                        caption=caption,
-                        parse_mode='Markdown'
-                    )
-                logger.info(f"✅ Backup sent to channel: {BACKUP_CHANNEL_ID}")
+                try:
+                    with open(file_path, 'rb') as f:
+                        self.bot.send_document(
+                            chat_id=BACKUP_CHANNEL_ID,
+                            document=f,
+                            caption=caption,
+                            parse_mode='Markdown'
+                        )
+                    logger.info(f"✅ Backup sent to channel: {BACKUP_CHANNEL_ID}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to send backup to channel {BACKUP_CHANNEL_ID}: {e}")
             
+            # ارسال به ادمین (در صورت وجود)
             if BACKUP_ADMIN_ID:
-                with open(backup_info["file_path"], 'rb') as f:
-                    self.bot.send_document(
-                        chat_id=BACKUP_ADMIN_ID,
-                        document=f,
-                        caption=caption,
-                        parse_mode='Markdown'
-                    )
-                logger.info(f"✅ Backup sent to admin: {BACKUP_ADMIN_ID}")
-            
-            os.remove(backup_info["file_path"])
+                try:
+                    with open(file_path, 'rb') as f:
+                        self.bot.send_document(
+                            chat_id=BACKUP_ADMIN_ID,
+                            document=f,
+                            caption=caption,
+                            parse_mode='Markdown'
+                        )
+                    logger.info(f"✅ Backup sent to admin: {BACKUP_ADMIN_ID}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to send backup to admin {BACKUP_ADMIN_ID}: {e}")
             
         except Exception as e:
-            logger.error(f"❌ Error sending backup to Telegram: {e}")
+            logger.error(f"❌ Error in send_backup_to_telegram: {e}")
+        finally:
+            # همیشه فایل بکاپ را پاک کن (چه موفق چه ناموفق)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"🗑️ Removed backup file: {file_path}")
 
 backup_manager = None
 
@@ -961,37 +975,9 @@ def handle_series_flow(message, text, step, session):
         bot.send_message(message.chat.id, f"✅ کیفیت '{text}' ثبت شد\n\nلطفاً فایل این قسمت را ارسال کنید:")
 
 # ==================== FILE HANDLERS ====================
+# توجه: ترتیب هندلرها اصلاح شده است. اول هندلر بکاپ، سپس هندلر اصلی
 
-@bot.message_handler(func=lambda message: message.from_user.id in ADMINS and message.photo, content_types=['photo'])
-def admin_photo_handler(message):
-    user_id = message.from_user.id
-    session = admin_sessions.get(user_id)
-    
-    if not session or session.get("step") != "poster_file":
-        return
-    
-    file_id = message.photo[-1].file_id
-    session["poster_file_id"] = file_id
-    session["step"] = "caption_template"
-    session["_timestamp"] = time.time()
-    bot.send_message(message.chat.id, "✅ پوستر ثبت شد\n\nلطفاً قالب کپشن قسمت‌ها را وارد کنید:\nیا /skip برای قالب پیش‌فرض")
-
-@bot.message_handler(func=lambda message: message.from_user.id in ADMINS and (message.document or message.video or message.audio), content_types=['document', 'video', 'audio'])
-def admin_file_handler(message):
-    user_id = message.from_user.id
-    session = admin_sessions.get(user_id)
-    
-    if not session:
-        return
-    
-    step = session.get("step")
-    mode = session.get("mode")
-    
-    if mode == "add_film" and step == "file":
-        handle_film_file(message, session, user_id)
-    elif mode == "add_series" and step == "episode_file":
-        handle_episode_file(message, session, user_id)
-
+# --- هندلر بکاپ (برای دریافت فایل بکاپ) ---
 @bot.message_handler(content_types=['document'])
 def handle_backup_file(message):
     if message.from_user.id not in ADMINS:
@@ -1053,6 +1039,39 @@ def restore_callback_handler(call):
         os.remove(backup_file)
         admin_sessions.pop(user_id, None)
 
+# --- هندلر اصلی برای فایل‌های فیلم/سریال ---
+@bot.message_handler(func=lambda message: message.from_user.id in ADMINS and (message.document or message.video or message.audio), content_types=['document', 'video', 'audio'])
+def admin_file_handler(message):
+    user_id = message.from_user.id
+    session = admin_sessions.get(user_id)
+    
+    if not session:
+        return
+    
+    step = session.get("step")
+    mode = session.get("mode")
+    
+    if mode == "add_film" and step == "file":
+        handle_film_file(message, session, user_id)
+    elif mode == "add_series" and step == "episode_file":
+        handle_episode_file(message, session, user_id)
+
+# --- هندلر عکس برای پوستر سریال ---
+@bot.message_handler(func=lambda message: message.from_user.id in ADMINS and message.photo, content_types=['photo'])
+def admin_photo_handler(message):
+    user_id = message.from_user.id
+    session = admin_sessions.get(user_id)
+    
+    if not session or session.get("step") != "poster_file":
+        return
+    
+    file_id = message.photo[-1].file_id
+    session["poster_file_id"] = file_id
+    session["step"] = "caption_template"
+    session["_timestamp"] = time.time()
+    bot.send_message(message.chat.id, "✅ پوستر ثبت شد\n\nلطفاً قالب کپشن قسمت‌ها را وارد کنید:\nیا /skip برای قالب پیش‌فرض")
+
+# --- توابع handle_film_file و handle_episode_file (بدون تغییر) ---
 def handle_film_file(message, session, user_id):
     if message.document:
         file_id = message.document.file_id
