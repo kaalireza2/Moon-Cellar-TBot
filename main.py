@@ -505,7 +505,7 @@ def start_handler(message):
 def status_command(message):
     if not is_user_admin(message.from_user.id):
         return
-    register_user(message.from_user)  # ثبت به‌روز
+    register_user(message.from_user)
     if is_user_banned(message.from_user.id):
         return
     try:
@@ -514,35 +514,34 @@ def status_command(message):
             bot.send_message(message.chat.id, f"❌ خطا در بررسی وضعیت: {status_info['error']}")
             return
         status_text = f"""
-📊 **وضعیت سیستم**
+📊 <b>وضعیت سیستم</b>
 
-🤖 **بات:**
+🤖 <b>بات:</b>
 • نام: @{status_info['bot_username']}
 • آیدی: {status_info['bot_id']}
 • وضعیت: فعال ✅
 
-🗄️ **دیتابیس:**
+🗄️ <b>دیتابیس:</b>
 • وضعیت: {status_info['database_status'].upper()}
 • تعداد فیلم‌ها: {status_info['database_count']}
 
-🖥️ **سرور:**
+🖥️ <b>سرور:</b>
 • سیستم: {status_info['system']}
 • Uptime: {status_info['uptime']}
 • حافظه: {status_info['memory_percent']}%
 • شروع: {status_info['start_time']}
 
-📈 **آمار:**
+📈 <b>آمار:</b>
 • Restartها: {status_info['restart_count']}
 • Sessionها: {status_info['admin_sessions']}
 • زمان: {status_info['current_time']}
 
-🔄 **Keep-alive: فعال**
-📡 **پینگ: هر 45 ثانیه**
+🔄 Keep-alive: فعال
+📡 پینگ: هر 45 ثانیه
         """
-        bot.send_message(message.chat.id, status_text, parse_mode='Markdown')
+        bot.send_message(message.chat.id, status_text, parse_mode='HTML')
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ خطا در بررسی وضعیت: {str(e)}")
-
 # ==================== دستورات بکاپ ====================
 
 @bot.message_handler(commands=['backup'])
@@ -592,7 +591,7 @@ def userinfo_command(message):
         return
     args = message.text.split()
     if len(args) < 2:
-        bot.send_message(message.chat.id, "❌ لطفاً آیدی یا یوزرنیم کاربر را وارد کنید.\nمثال: `/userinfo 123456789` یا `/userinfo @username`", parse_mode='Markdown')
+        bot.send_message(message.chat.id, "❌ لطفاً آیدی یا یوزرنیم کاربر را وارد کنید.\nمثال: <code>/userinfo 123456789</code> یا <code>/userinfo @username</code>", parse_mode='HTML')
         return
     target = args[1]
     try:
@@ -606,11 +605,20 @@ def userinfo_command(message):
             bot.send_message(message.chat.id, "❌ کاربر یافت نشد.")
             return
         u = result.data[0]
-        text = f"👤 **اطلاعات کاربر**\n\n🆔 آیدی: `{u['user_id']}`\n📛 نام: {u.get('first_name', '?')} {u.get('last_name', '')}\n🔖 یوزرنیم: @{u.get('username', 'ندارد')}\n📅 عضو شده: {u['joined_at'][:19]}\n🕘 آخرین فعالیت: {u['last_active'][:19]}\n📥 دانلودها: {u['total_downloads']}\n🚫 مسدود: {'بله' if u['is_banned'] else 'خیر'}\n👑 ادمین: {'بله' if u['is_admin'] else 'خیر'}"
-        bot.send_message(message.chat.id, text, parse_mode='Markdown')
+        text = f"""👤 <b>اطلاعات کاربر</b>
+
+🆔 آیدی: <code>{u['user_id']}</code>
+📛 نام: {u.get('first_name', '?')} {u.get('last_name', '')}
+🔖 یوزرنیم: @{u.get('username', 'ندارد')}
+📅 عضو شده: {u['joined_at'][:19]}
+🕘 آخرین فعالیت: {u['last_active'][:19]}
+📥 دانلودها: {u['total_downloads']}
+🚫 مسدود: {'بله' if u['is_banned'] else 'خیر'}
+👑 ادمین: {'بله' if u['is_admin'] else 'خیر'}"""
+        bot.send_message(message.chat.id, text, parse_mode='HTML')
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ خطا: {e}")
-
+        
 @bot.message_handler(commands=['ban'])
 def ban_user_command(message):
     if not is_user_admin(message.from_user.id):
@@ -693,7 +701,7 @@ def userslist_command(message):
     show_users_page(message.chat.id, page, message.message_id)
 
 def show_users_page(chat_id, page, message_id=None):
-    """نمایش صفحه از لیست کاربران با صفحه‌بندی"""
+    """نمایش صفحه از لیست کاربران با صفحه‌بندی - با HTML"""
     per_page = 10
     offset = (page - 1) * per_page
     try:
@@ -707,7 +715,7 @@ def show_users_page(chat_id, page, message_id=None):
             else:
                 bot.send_message(chat_id, text)
             return
-        text = f"📋 **لیست کاربران (صفحه {page})**\n\n"
+        text = f"📋 <b>لیست کاربران (صفحه {page})</b>\n\n"
         for u in users:
             status = "🚫" if u.get('is_banned') else "✅"
             admin_flag = "👑 " if u.get('is_admin') else ""
@@ -715,7 +723,7 @@ def show_users_page(chat_id, page, message_id=None):
             name = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "بدون نام"
             last_active = u['last_active'][:19] if u.get('last_active') else "نامشخص"
             downloads = u.get('total_downloads', 0)
-            text += f"{status} {admin_flag}`{u['user_id']}`{username_str}\n📛 {name}\n🕒 {last_active}\n📥 {downloads}\n\n"
+            text += f"{status} {admin_flag}<code>{u['user_id']}</code>{username_str}\n📛 {name}\n🕒 {last_active}\n📥 {downloads}\n\n"
         total_pages = (total_count + per_page - 1) // per_page
         keyboard = InlineKeyboardMarkup()
         if page > 1:
@@ -726,9 +734,9 @@ def show_users_page(chat_id, page, message_id=None):
             else:
                 keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
         if message_id:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='Markdown')
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='HTML')
         else:
-            bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='Markdown')
+            bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error in userslist: {e}")
         bot.send_message(chat_id, f"❌ خطا: {e}")
