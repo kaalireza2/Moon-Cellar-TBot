@@ -61,6 +61,12 @@ admin_sessions = {}
 start_time = datetime.now()
 restart_count = 0
 
+# ==================== Spam detection ====================
+user_message_times = {}  # {user_id: [list of timestamps]}
+SPAM_WINDOW = 10         # seconds
+SPAM_LIMIT = 5           # number of messages allowed in window
+SPAM_NOTIFIED = {}       # {user_id: bool} to avoid repeated alerts
+
 # ==================== کلاس BackupManager ====================
 
 class BackupManager:
@@ -412,6 +418,38 @@ def get_user_stats():
         logger.error(f"Error getting user stats: {e}")
         return {"total": 0, "active_today": 0, "banned": 0}
 
+# ==================== Spam check function ====================
+def check_spam(user_id, username=None, first_name=None):
+    """بررسی اسپم و ارسال هشدار به ادمین در صورت نیاز"""
+    now = time.time()
+    if user_id not in user_message_times:
+        user_message_times[user_id] = []
+    # حذف تایم‌های قدیمی‌تر از پنجره
+    user_message_times[user_id] = [t for t in user_message_times[user_id] if now - t < SPAM_WINDOW]
+    user_message_times[user_id].append(now)
+    
+    if len(user_message_times[user_id]) > SPAM_LIMIT:
+        # اسپم تشخیص داده شد
+        if user_id not in SPAM_NOTIFIED:
+            SPAM_NOTIFIED[user_id] = True
+            spam_text = (f"🚨 **اسپم تشخیص داده شد!**\n\n"
+                         f"🆔 کاربر: `{user_id}`\n"
+                         f"👤 نام: {first_name or '?'} (@{username or 'نامشخص'})\n"
+                         f"📨 تعداد پیام در {SPAM_WINDOW} ثانیه: {len(user_message_times[user_id])}\n\n"
+                         f"لطفاً برخورد لازم انجام دهید.")
+            for admin_id in ADMINS:
+                try:
+                    bot.send_message(admin_id, spam_text, parse_mode='Markdown')
+                except:
+                    pass
+            # می‌توانید کاربر را خودکار مسدود کنید: supabase.table("users").update({"is_banned": True}).eq("user_id", user_id).execute()
+            return True
+    else:
+        # اگر قبلاً هشدار داده شده و الان اسپم متوقف شده، پس از مدتی علامت را پاک کن (اختیاری)
+        # برای سادگی فعلاً پاک نمی‌کنیم
+        pass
+    return False
+
 # ==================== FLASK ROUTES ====================
 
 @app.route('/')
@@ -617,7 +655,7 @@ def broadcast_command(message):
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.send_message(message.chat.id, "❌ لطفاً متن پیام را وارد کنید.\nمثال: `/broadcast سلام به همه`", parse_mode='Markdown')
+        bot.send_message(message.chat.id, "❌ لطفاً متن پیام را وارد کنید.\nمثال: `/broadcast سلام به همه`\n\n⚠️ می‌توانید از HTML استفاده کنید:\n`<b>bold</b>`, `<i>italic</i>`, `<tg-spoiler>spoiler</tg-spoiler>`, `<code>code</code>`, `<pre>pre</pre>`, `<a href=\"url\">link</a>`", parse_mode='Markdown')
         return
     text = args[1]
     try:
@@ -630,7 +668,7 @@ def broadcast_command(message):
         bot.send_message(message.chat.id, f"🔄 در حال ارسال پیام به {len(users.data)} کاربر...")
         for user in users.data:
             try:
-                bot.send_message(user['user_id'], text, parse_mode='Markdown')
+                bot.send_message(user['user_id'], text, parse_mode='HTML')
                 sent += 1
                 time.sleep(0.05)
             except:
@@ -638,6 +676,72 @@ def broadcast_command(message):
         bot.send_message(message.chat.id, f"✅ ارسال شد: {sent}\n❌ ناموفق: {failed}")
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ خطا: {e}")
+
+# ==================== USERS LIST (PAGINATED) ====================
+
+@bot.message_handler(commands=['userslist'])
+def userslist_command(message):
+    if not is_user_admin(message.from_user.id):
+        return
+    page = 1
+    args = message.text.split()
+    if len(args) > 1:
+        try:
+            page = int(args[1])
+        except:
+            page = 1
+    show_users_page(message.chat.id, page, message.message_id)
+
+def show_users_page(chat_id, page, message_id=None):
+    """نمایش صفحه از لیست کاربران با صفحه‌بندی"""
+    per_page = 10
+    offset = (page - 1) * per_page
+    try:
+        total_count = supabase.table("users").select("count", count="exact").execute().count
+        response = supabase.table("users").select("user_id, username, first_name, last_name, last_active, total_downloads, is_banned, is_admin").order("last_active", desc=True).range(offset, offset + per_page - 1).execute()
+        users = response.data
+        if not users:
+            text = "❌ هیچ کاربری یافت نشد."
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id)
+            else:
+                bot.send_message(chat_id, text)
+            return
+        text = f"📋 **لیست کاربران (صفحه {page})**\n\n"
+        for u in users:
+            status = "🚫" if u.get('is_banned') else "✅"
+            admin_flag = "👑 " if u.get('is_admin') else ""
+            username_str = f" @{u['username']}" if u.get('username') else ""
+            name = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "بدون نام"
+            last_active = u['last_active'][:19] if u.get('last_active') else "نامشخص"
+            downloads = u.get('total_downloads', 0)
+            text += f"{status} {admin_flag}`{u['user_id']}`{username_str}\n📛 {name}\n🕒 {last_active}\n📥 {downloads}\n\n"
+        total_pages = (total_count + per_page - 1) // per_page
+        keyboard = InlineKeyboardMarkup()
+        if page > 1:
+            keyboard.add(InlineKeyboardButton("◀️ قبلی", callback_data=f"users_page_{page-1}"))
+        if page < total_pages:
+            if keyboard.keyboard:
+                keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
+            else:
+                keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
+        if message_id:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in userslist: {e}")
+        bot.send_message(chat_id, f"❌ خطا: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('users_page_'))
+def users_page_callback(call):
+    user_id = call.from_user.id
+    if not is_user_admin(user_id):
+        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        return
+    page = int(call.data.split('_')[2])
+    show_users_page(call.message.chat.id, page, call.message.message_id)
+    bot.answer_callback_query(call.id)
 
 # ==================== ADMIN PANEL ====================
 
@@ -786,9 +890,11 @@ def admin_callback_handler(call):
         text = f"📊 **آمار کاربران**\n\n👥 کل: {stats['total']}\n✅ فعال امروز: {stats['active_today']}\n🚫 مسدود: {stats['banned']}"
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
+    elif data == "admin_users_list":
+        userslist_command(call.message)
     elif data == "admin_broadcast":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "📢 لطفاً متن پیام همگانی را با دستور `/broadcast متن` ارسال کنید.", parse_mode='Markdown')
+        bot.send_message(call.message.chat.id, "📢 لطفاً متن پیام همگانی را با دستور `/broadcast متن` ارسال کنید.\n\n⚠️ می‌توانید از HTML استفاده کنید: `<b>bold</b>`, `<i>italic</i>`, `<tg-spoiler>spoiler</tg-spoiler>`", parse_mode='Markdown')
     elif data == "admin_done":
         admin_sessions.pop(user_id, None)
         bot.edit_message_text("✅ عملیات با موفقیت تمام شد.", call.message.chat.id, call.message.message_id)
@@ -824,6 +930,7 @@ def show_backup_menu(call):
 def show_users_admin_menu(call):
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_user_stats"))
+    keyboard.add(InlineKeyboardButton("📋 لیست کاربران", callback_data="admin_users_list"))
     keyboard.add(InlineKeyboardButton("📢 ارسال همگانی", callback_data="admin_broadcast"))
     keyboard.add(InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back"))
     bot.edit_message_text("👥 **مدیریت کاربران**\nلطفاً یک گزینه را انتخاب کنید:", call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
@@ -1270,6 +1377,12 @@ def all_messages(message):
     if is_user_banned(user_id):
         bot.send_message(message.chat.id, "⛔ شما از دسترسی به ربات مسدود شده‌اید.")
         return
+    
+    # چک اسپم فقط برای کاربران غیر ادمین
+    if user_id not in ADMINS:
+        check_spam(user_id, message.from_user.username, message.from_user.first_name)
+        # (اختیاری) می‌توانیم در صورت اسپم شدید، پاسخ ندهیم یا مسدود کنیم
+    
     if message.from_user.id in ADMINS:
         show_admin_panel(message)
     else:
@@ -1326,7 +1439,7 @@ def run_bot():
                 logger.critical(f"🚨 CRITICAL: Bot restarted {restart_count} times!")
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting bot with BACKUP system and USER MANAGEMENT...")
+    logger.info("🚀 Starting bot with BACKUP system, USER MANAGEMENT, SPAM DETECTION...")
     start_time = datetime.now()
     logger.info(f"📅 Start time: {start_time}")
     try:
