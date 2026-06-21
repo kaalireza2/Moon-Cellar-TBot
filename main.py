@@ -90,7 +90,6 @@ class BackupManager:
                 "data": {}
             }
             
-            # اضافه کردن جدول users به بکاپ
             tables = ["films", "film_qualities", "series", "episodes", "users"]
             
             for table in tables:
@@ -163,13 +162,17 @@ class BackupManager:
             
             for table in tables:
                 if table in backup_data["data"]:
-                    # پاک کردن اطلاعات قبلی
-                    self.supabase.table(table).delete().neq("id", 0).execute()
+                    # دیباگ حذف رکوردها: با استفاده از شرط کلیدی تر ترجیحا کل دیتای جدول را خالی میکنیم
+                    try:
+                        self.supabase.table(table).delete().neq("created_at", "1970-01-01").execute()
+                    except:
+                        # فال‌بک در صورتی که فیلد زمان وجود نداشته باشد
+                        self.supabase.table(table).delete().filter("id", "gt", 0).execute()
                     
-                    # اضافه کردن اطلاعات جدید بدون فیلد id
+                    # اضافه کردن مجدد رکوردها
                     for record in backup_data["data"][table]:
-                        record_copy = {k: v for k, v in record.items() if k != 'id'}
-                        self.supabase.table(table).insert(record_copy).execute()
+                        # حذف فیلد آی‌دی خودکار در صورت نیاز، اما برای چسبندگی ریلیشن‌ها دیتای کامل وارد می‌شود
+                        self.supabase.table(table).insert(record).execute()
                     
                     logger.info(f"✅ Restored {table}: {len(backup_data['data'][table])} records")
             
@@ -370,6 +373,9 @@ def register_user(user):
         }
         if not existing.data:
             user_data["joined_at"] = datetime.now().isoformat()
+            user_data["total_downloads"] = 0
+            user_data["is_banned"] = False
+            user_data["is_admin"] = user.id in ADMINS
             supabase.table("users").insert(user_data).execute()
             logger.info(f"✅ New user registered: {user.id} (@{user.username})")
         else:
@@ -379,8 +385,12 @@ def register_user(user):
         logger.error(f"Error registering user {user.id}: {e}")
 
 def update_user_downloads(user_id):
+    """دیباگ: اصلاح استفاده غلط از supabase.raw"""
     try:
-        supabase.table("users").update({"total_downloads": supabase.raw("total_downloads + 1")}).eq("user_id", user_id).execute()
+        result = supabase.table("users").select("total_downloads").eq("user_id", user_id).execute()
+        if result.data:
+            current_downloads = result.data[0].get("total_downloads", 0) or 0
+            supabase.table("users").update({"total_downloads": current_downloads + 1}).eq("user_id", user_id).execute()
     except Exception as e:
         logger.error(f"Error updating downloads for {user_id}: {e}")
 
@@ -410,9 +420,9 @@ def get_user_stats():
         active_today = supabase.table("users").select("count", count="exact").gte("last_active", datetime.now().replace(hour=0, minute=0, second=0).isoformat()).execute()
         banned = supabase.table("users").select("count", count="exact").eq("is_banned", True).execute()
         return {
-            "total": total.count,
-            "active_today": active_today.count,
-            "banned": banned.count
+            "total": total.count if total.count is not None else 0,
+            "active_today": active_today.count if active_today.count is not None else 0,
+            "banned": banned.count if banned.count is not None else 0
         }
     except Exception as e:
         logger.error(f"Error getting user stats: {e}")
@@ -424,30 +434,24 @@ def check_spam(user_id, username=None, first_name=None):
     now = time.time()
     if user_id not in user_message_times:
         user_message_times[user_id] = []
-    # حذف تایم‌های قدیمی‌تر از پنجره
+    
     user_message_times[user_id] = [t for t in user_message_times[user_id] if now - t < SPAM_WINDOW]
     user_message_times[user_id].append(now)
     
     if len(user_message_times[user_id]) > SPAM_LIMIT:
-        # اسپم تشخیص داده شد
         if user_id not in SPAM_NOTIFIED:
             SPAM_NOTIFIED[user_id] = True
             spam_text = (f"🚨 **اسپم تشخیص داده شد!**\n\n"
                          f"🆔 کاربر: `{user_id}`\n"
                          f"👤 نام: {first_name or '?'} (@{username or 'نامشخص'})\n"
                          f"📨 تعداد پیام در {SPAM_WINDOW} ثانیه: {len(user_message_times[user_id])}\n\n"
-                         f"لطفاً برخورد لازم انجام دهید.")
+                         f"کاربر به صورت خودکار بلاک نشد اما فعالیت او محدود شد.")
             for admin_id in ADMINS:
                 try:
                     bot.send_message(admin_id, spam_text, parse_mode='Markdown')
                 except:
                     pass
-            # می‌توانید کاربر را خودکار مسدود کنید: supabase.table("users").update({"is_banned": True}).eq("user_id", user_id).execute()
-            return True
-    else:
-        # اگر قبلاً هشدار داده شده و الان اسپم متوقف شده، پس از مدتی علامت را پاک کن (اختیاری)
-        # برای سادگی فعلاً پاک نمی‌کنیم
-        pass
+        return True
     return False
 
 # ==================== FLASK ROUTES ====================
@@ -487,7 +491,7 @@ def bot_health():
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user = message.from_user
-    register_user(user)  # ثبت کاربر
+    register_user(user)  
     if is_user_banned(user.id):
         bot.send_message(message.chat.id, "⛔ شما از دسترسی به ربات مسدود شده‌اید.")
         return
@@ -542,6 +546,7 @@ def status_command(message):
         bot.send_message(message.chat.id, status_text, parse_mode='HTML')
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ خطا در بررسی وضعیت: {str(e)}")
+
 # ==================== دستورات بکاپ ====================
 
 @bot.message_handler(commands=['backup'])
@@ -610,11 +615,11 @@ def userinfo_command(message):
 🆔 آیدی: <code>{u['user_id']}</code>
 📛 نام: {u.get('first_name', '?')} {u.get('last_name', '')}
 🔖 یوزرنیم: @{u.get('username', 'ندارد')}
-📅 عضو شده: {u['joined_at'][:19]}
-🕘 آخرین فعالیت: {u['last_active'][:19]}
-📥 دانلودها: {u['total_downloads']}
-🚫 مسدود: {'بله' if u['is_banned'] else 'خیر'}
-👑 ادمین: {'بله' if u['is_admin'] else 'خیر'}"""
+📅 عضو شده: {u.get('joined_at', 'نامشخص')[:19]}
+🕘 آخرین فعالیت: {u.get('last_active', 'نامشخص')[:19]}
+📥 دانلودها: {u.get('total_downloads', 0)}
+🚫 مسدود: {'بله' if u.get('is_banned') else 'خیر'}
+👑 ادمین: {'بله' if u.get('is_admin') else 'خیر'}"""
         bot.send_message(message.chat.id, text, parse_mode='HTML')
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ خطا: {e}")
@@ -663,7 +668,7 @@ def broadcast_command(message):
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.send_message(message.chat.id, "❌ لطفاً متن پیام را وارد کنید.\nمثال: `/broadcast سلام به همه`\n\n⚠️ می‌توانید از HTML استفاده کنید:\n`<b>bold</b>`, `<i>italic</i>`, `<tg-spoiler>spoiler</tg-spoiler>`, `<code>code</code>`, `<pre>pre</pre>`, `<a href=\"url\">link</a>`", parse_mode='Markdown')
+        bot.send_message(message.chat.id, "❌ لطفاً متن پیام را وارد کنید.\nمثال: `/broadcast سلام به همه`", parse_mode='Markdown')
         return
     text = args[1]
     try:
@@ -701,11 +706,11 @@ def userslist_command(message):
     show_users_page(message.chat.id, page, message.message_id)
 
 def show_users_page(chat_id, page, message_id=None):
-    """نمایش صفحه از لیست کاربران با صفحه‌بندی - با HTML"""
     per_page = 10
     offset = (page - 1) * per_page
     try:
         total_count = supabase.table("users").select("count", count="exact").execute().count
+        if total_count is None: total_count = 0
         response = supabase.table("users").select("user_id, username, first_name, last_name, last_active, total_downloads, is_banned, is_admin").order("last_active", desc=True).range(offset, offset + per_page - 1).execute()
         users = response.data
         if not users:
@@ -729,10 +734,7 @@ def show_users_page(chat_id, page, message_id=None):
         if page > 1:
             keyboard.add(InlineKeyboardButton("◀️ قبلی", callback_data=f"users_page_{page-1}"))
         if page < total_pages:
-            if keyboard.keyboard:
-                keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
-            else:
-                keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
+            keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
         if message_id:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='HTML')
         else:
@@ -745,7 +747,7 @@ def show_users_page(chat_id, page, message_id=None):
 def users_page_callback(call):
     user_id = call.from_user.id
     if not is_user_admin(user_id):
-        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز")
         return
     page = int(call.data.split('_')[2])
     show_users_page(call.message.chat.id, page, call.message.message_id)
@@ -872,7 +874,7 @@ def show_episode_qualities(message, series_key, episode_num):
 def admin_callback_handler(call):
     user_id = call.from_user.id
     if user_id not in ADMINS:
-        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز")
         return
     data = call.data
     if data == "admin_add_film":
@@ -902,7 +904,7 @@ def admin_callback_handler(call):
         userslist_command(call.message)
     elif data == "admin_broadcast":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "📢 لطفاً متن پیام همگانی را با دستور `/broadcast متن` ارسال کنید.\n\n⚠️ می‌توانید از HTML استفاده کنید: `<b>bold</b>`, `<i>italic</i>`, `<tg-spoiler>spoiler</tg-spoiler>`", parse_mode='Markdown')
+        bot.send_message(call.message.chat.id, "📢 لطفاً متن پیام همگانی را با دستور `/broadcast متن` ارسال کنید.", parse_mode='Markdown')
     elif data == "admin_done":
         admin_sessions.pop(user_id, None)
         bot.edit_message_text("✅ عملیات با موفقیت تمام شد.", call.message.chat.id, call.message.message_id)
@@ -994,7 +996,7 @@ def show_delete_options(call):
 def delete_options_handler(call):
     user_id = call.from_user.id
     if user_id not in ADMINS:
-        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز")
         return
     if call.data == "delete_films":
         show_films_for_deletion(call)
@@ -1039,7 +1041,7 @@ def show_series_for_deletion(call):
 def delete_callback_handler(call):
     user_id = call.from_user.id
     if user_id not in ADMINS:
-        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز")
         return
     if call.data.startswith("delf:"):
         film_id = call.data.split(":")[1]
@@ -1185,20 +1187,14 @@ def handle_series_flow(message, text, step, session):
         bot.send_message(message.chat.id, f"✅ کیفیت '{text}' ثبت شد\n\nلطفاً فایل این قسمت را ارسال کنید:")
 
 # ==================== FILE HANDLERS ====================
-# ترتیب: اول هندلر بکاپ، سپس هندلر اصلی
+# دیباگ: جابجایی هندلرها برای جداسازی بکاپ و فایل‌های آپلودی مدیا
 
-@bot.message_handler(content_types=['document'])
+@bot.message_handler(func=lambda message: is_user_admin(message.from_user.id) and message.document and (message.document.file_name.endswith('.json') or message.document.file_name.endswith('.json.gz')), content_types=['document'])
 def handle_backup_file(message):
-    if not is_user_admin(message.from_user.id):
-        return
     register_user(message.from_user)
     if is_user_banned(message.from_user.id):
         return
-    if not message.document:
-        return
     filename = message.document.file_name
-    if not (filename.endswith('.json') or filename.endswith('.json.gz')):
-        return
     keyboard = InlineKeyboardMarkup()
     keyboard.row(InlineKeyboardButton("✅ بله، بازیابی کن", callback_data="confirm_restore"), InlineKeyboardButton("❌ لغو", callback_data="cancel_restore"))
     bot.send_message(message.chat.id, f"⚠️ **تأیید بازیابی**\n\nفایل: `{filename}`\n\nآیا مطمئن هستید؟", reply_markup=keyboard, parse_mode='Markdown')
@@ -1213,7 +1209,7 @@ def handle_backup_file(message):
 def restore_callback_handler(call):
     user_id = call.from_user.id
     if not is_user_admin(user_id):
-        bot.answer_callback_query(call.id, "❌ دسترسی denied")
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز")
         return
     session = admin_sessions.get(user_id, {})
     if call.data == "cancel_restore":
@@ -1234,7 +1230,8 @@ def restore_callback_handler(call):
             bot.send_message(call.message.chat.id, "✅ دیتابیس با موفقیت بازیابی شد!")
         else:
             bot.send_message(call.message.chat.id, "❌ خطا در بازیابی دیتابیس")
-        os.remove(backup_file)
+        if os.path.exists(backup_file):
+            os.remove(backup_file)
         admin_sessions.pop(user_id, None)
 
 @bot.message_handler(func=lambda message: message.from_user.id in ADMINS and (message.document or message.video or message.audio), content_types=['document', 'video', 'audio'])
@@ -1319,7 +1316,7 @@ def handle_episode_file(message, session, user_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('quality:'))
 def quality_callback_handler(call):
     user_id = call.from_user.id
-    register_user(call.from_user)  # ثبت کاربر
+    register_user(call.from_user)  
     if is_user_banned(user_id):
         bot.answer_callback_query(call.id, "⛔ شما مسدود هستید")
         return
@@ -1331,7 +1328,7 @@ def quality_callback_handler(call):
             if result.data:
                 r = result.data[0]
                 bot.send_document(call.message.chat.id, r['file_id'], caption=r['caption'])
-                update_user_downloads(user_id)  # افزایش شمارش دانلود
+                update_user_downloads(user_id)  
                 bot.answer_callback_query(call.id, "✅ فایل ارسال شد")
             else:
                 bot.answer_callback_query(call.id, "❌ فایل یافت نشد")
@@ -1386,10 +1383,9 @@ def all_messages(message):
         bot.send_message(message.chat.id, "⛔ شما از دسترسی به ربات مسدود شده‌اید.")
         return
     
-    # چک اسپم فقط برای کاربران غیر ادمین
     if user_id not in ADMINS:
-        check_spam(user_id, message.from_user.username, message.from_user.first_name)
-        # (اختیاری) می‌توانیم در صورت اسپم شدید، پاسخ ندهیم یا مسدود کنیم
+        if check_spam(user_id, message.from_user.username, message.from_user.first_name):
+            return
     
     if message.from_user.id in ADMINS:
         show_admin_panel(message)
