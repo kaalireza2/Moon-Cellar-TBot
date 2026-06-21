@@ -703,7 +703,8 @@ def userslist_command(message):
             page = int(args[1])
         except:
             page = 1
-    show_users_page(message.chat.id, page, message.message_id)
+    # برای دستور متنی، message_id را ارسال نمی‌کنیم تا پیام جدید فرستاده شود
+    show_users_page(message.chat.id, page, message_id=None)
 
 def show_users_page(chat_id, page, message_id=None):
     per_page = 10
@@ -713,6 +714,7 @@ def show_users_page(chat_id, page, message_id=None):
         if total_count is None: total_count = 0
         response = supabase.table("users").select("user_id, username, first_name, last_name, last_active, total_downloads, is_banned, is_admin").order("last_active", desc=True).range(offset, offset + per_page - 1).execute()
         users = response.data
+        
         if not users:
             text = "❌ هیچ کاربری یافت نشد."
             if message_id:
@@ -720,6 +722,7 @@ def show_users_page(chat_id, page, message_id=None):
             else:
                 bot.send_message(chat_id, text)
             return
+
         text = f"📋 <b>لیست کاربران (صفحه {page})</b>\n\n"
         for u in users:
             status = "🚫" if u.get('is_banned') else "✅"
@@ -729,16 +732,32 @@ def show_users_page(chat_id, page, message_id=None):
             last_active = u['last_active'][:19] if u.get('last_active') else "نامشخص"
             downloads = u.get('total_downloads', 0)
             text += f"{status} {admin_flag}<code>{u['user_id']}</code>{username_str}\n📛 {name}\n🕒 {last_active}\n📥 {downloads}\n\n"
+        
         total_pages = (total_count + per_page - 1) // per_page
         keyboard = InlineKeyboardMarkup()
+        
+        # ایجاد دکمه‌ها در یک ردیف
+        buttons = []
         if page > 1:
-            keyboard.add(InlineKeyboardButton("◀️ قبلی", callback_data=f"users_page_{page-1}"))
+            buttons.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"users_page_{page-1}"))
         if page < total_pages:
-            keyboard.add(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
+            buttons.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"users_page_{page+1}"))
+        if buttons:
+            keyboard.row(*buttons)
+
+        # اصلاح اصلی: تشخیص اینکه پیام باید ادیت شود یا پیام جدید ارسال شود
         if message_id:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='HTML')
+            try:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard, parse_mode='HTML')
+            except telebot.api_helper.ApiTelegramException as e:
+                # اگر متن تغییری نکرده بود و ارور ادیت داد، فقط آن را نادیده بگیرد
+                if "message is not modified" in str(e):
+                    pass
+                else:
+                    raise e
         else:
             bot.send_message(chat_id, text, reply_markup=keyboard, parse_mode='HTML')
+            
     except Exception as e:
         logger.error(f"Error in userslist: {e}")
         bot.send_message(chat_id, f"❌ خطا: {e}")
